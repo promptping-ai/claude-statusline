@@ -8,18 +8,34 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
-  id-token: write  # Required for Claude Code OIDC
 
 jobs:
-  ci:
-    uses: promptping-ai/.github/.github/workflows/graphite-swift-ci.yml@v1
-    secrets: inherit
+  build:
+    name: Build & Test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
 
-  rules:
-    uses: promptping-ai/.github/.github/workflows/swift-rules-check.yml@v1
-    secrets: inherit
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app
 
-  review:
-    uses: promptping-ai/.github/.github/workflows/swift-review.yml@v1
-    secrets: inherit
+      - name: Build
+        run: swift build
+
+      - name: Run Tests
+        run: swift test
+
+      - name: Build Release
+        run: swift build -c release
+
+  lint:
+    name: Swift Format
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app
+
+      - name: Check Formatting
+        run: swift format lint -s -p -r Sources Tests Package.swift
