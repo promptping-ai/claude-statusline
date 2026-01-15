@@ -9,6 +9,10 @@ import Subprocess
   import SystemPackage
 #endif
 
+/// Global debug mode flag (set from command line)
+/// Using nonisolated(unsafe) as this is a single-threaded CLI tool
+nonisolated(unsafe) var debugMode = false
+
 @main
 struct ClaudeStatusline: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
@@ -21,33 +25,92 @@ struct ClaudeStatusline: AsyncParsableCommand {
       - Line 3: Graphite stack visualization
 
       Supports GitHub, Azure DevOps, and GitLab via pull-request-ping.
+
+      Use --test to run without stdin (uses current directory):
+        cd /path/to/project && claude-statusline --test --debug
       """
   )
 
+  @Flag(name: .long, help: "Output diagnostic information to stderr")
+  var debug = false
+
+  @Flag(name: .long, help: "Test mode: use current directory instead of stdin input")
+  var test = false
+
   func run() async throws {
-    // Read JSON input from stdin
-    let inputData = FileHandle.standardInput.readDataToEndOfFile()
-    guard let input = try? JSONDecoder().decode(StatusInput.self, from: inputData)
-    else {
-      print("Error: Invalid JSON input")
-      return
+    // Set global debug mode
+    debugMode = debug
+
+    if debug {
+      debugLog("=== Claude Statusline Starting ===")
+      debugLog("Debug mode: enabled")
+      debugLog("Test mode: \(test)")
     }
 
-    let cwd = input.workspace.currentDir
-    let project = URL(fileURLWithPath: cwd).lastPathComponent
+    let cwd: String
+    let project: String
+    var input: StatusInput?
+
+    if test {
+      // Test mode: use current working directory
+      cwd = FileManager.default.currentDirectoryPath
+      project = URL(fileURLWithPath: cwd).lastPathComponent
+      input = nil
+      if debug {
+        debugLog("Using current directory (test mode)")
+      }
+    } else {
+      // Normal mode: read JSON from stdin
+      if debug {
+        debugLog("Reading JSON from stdin...")
+      }
+      let inputData = FileHandle.standardInput.readDataToEndOfFile()
+      guard let parsedInput = try? JSONDecoder().decode(StatusInput.self, from: inputData)
+      else {
+        print("Error: Invalid JSON input")
+        return
+      }
+      input = parsedInput
+      cwd = parsedInput.workspace.currentDir
+      project = URL(fileURLWithPath: cwd).lastPathComponent
+    }
 
     // Get branch name
     let branch = await getBranch(cwd: cwd)
 
+    // Get remote URL for platform detection
+    let remoteURL = await getRemoteURL(cwd: cwd)
+    let platform = remoteURL.map { Platform.detect(from: $0) } ?? .unknown
+
+    // Debug output
+    if debugMode {
+      debugLog("=== Claude Statusline Debug ===")
+      debugLog("CWD: \(cwd)")
+      debugLog("Project: \(project)")
+      debugLog("Branch: \(branch ?? "none")")
+      debugLog("Remote URL: \(remoteURL ?? "none")")
+      debugLog("Platform: \(platform)")
+      if platform == .azure, let url = remoteURL {
+        if let azureContext = parseAzureContext(from: url) {
+          debugLog("Azure Org: \(azureContext.organization)")
+          debugLog("Azure Project: \(azureContext.project)")
+          debugLog("Azure Repo: \(azureContext.repository)")
+        } else {
+          debugLog("Azure Context: FAILED TO PARSE")
+        }
+      }
+      debugLog("================================")
+    }
+
     // Get plan subject from session mapping
-    let planName = getPlanSubject(sessionId: input.sessionId)
+    let planName = getPlanSubject(sessionId: input?.sessionId)
 
     // Build Line 1: Main status
     printLine1(
       project: project,
       planName: planName,
-      model: input.model.displayName ?? "Claude",
-      contextUsage: input.contextWindow,
+      model: input?.model.displayName ?? (test ? "Test" : "Claude"),
+      contextUsage: input?.contextWindow,
       account: ProcessInfo.processInfo.environment["CLAUDE_ACCOUNT"]
     )
 
@@ -61,6 +124,11 @@ struct ClaudeStatusline: AsyncParsableCommand {
       await printLine3(cwd: cwd)
     }
   }
+}
+
+/// Log debug message to stderr
+func debugLog(_ message: String) {
+  FileHandle.standardError.write(Data("[DEBUG] \(message)\n".utf8))
 }
 
 // MARK: - Input Models
@@ -151,6 +219,152 @@ enum Platform {
       return .gitlab
     }
     return .unknown
+  }
+}
+
+// MARK: - Azure DevOps Context
+
+/// Holds parsed Azure DevOps organization, project, and repository info
+struct AzureContext {
+  let organization: String
+  let project: String
+  let repository: String
+
+  /// Full organization URL for az CLI commands
+  var organizationURL: String {
+    "https://dev.azure.com/\(organization)"
+  }
+}
+
+/// Parse Azure DevOps context from git remote URL
+/// Supports patterns:
+/// - https://username@dev.azure.com/org/project/_git/repo
+/// - https://dev.azure.com/org/project/_git/repo
+/// - git@ssh.dev.azure.com:v3/org/project/repo
+func parseAzureContext(from remoteURL: String) -> AzureContext? {
+  // Pattern 1: HTTPS with optional username
+  // https://grouperossel@dev.azure.com/grouperossel/Le%20Soir/_git/iOS_Le_Soir
+  // https://dev.azure.com/org/project/_git/repo
+  if remoteURL.contains("dev.azure.com") && remoteURL.contains("/_git/") {
+    // Remove https:// and optional username@
+    var url = remoteURL
+    if url.hasPrefix("https://") {
+      url = String(url.dropFirst(8))
+    }
+    // Remove username@ if present
+    if let atIndex = url.firstIndex(of: "@") {
+      url = String(url[url.index(after: atIndex)...])
+    }
+    // Now: dev.azure.com/org/project/_git/repo
+    let parts = url.split(separator: "/")
+    // parts: ["dev.azure.com", "org", "project", "_git", "repo"]
+    guard parts.count >= 5,
+      parts[0] == "dev.azure.com",
+      parts[3] == "_git"
+    else { return nil }
+
+    let org = String(parts[1])
+    let project = String(parts[2]).removingPercentEncoding ?? String(parts[2])
+    let repo = String(parts[4])
+    return AzureContext(organization: org, project: project, repository: repo)
+  }
+
+  // Pattern 2: SSH
+  // git@ssh.dev.azure.com:v3/org/project/repo
+  if remoteURL.hasPrefix("git@ssh.dev.azure.com:v3/") {
+    let path = String(remoteURL.dropFirst("git@ssh.dev.azure.com:v3/".count))
+    let parts = path.split(separator: "/")
+    // parts: ["org", "project", "repo"]
+    guard parts.count >= 3 else { return nil }
+
+    let org = String(parts[0])
+    let project = String(parts[1])
+    let repo = String(parts[2])
+    return AzureContext(organization: org, project: project, repository: repo)
+  }
+
+  // Pattern 3: visualstudio.com (legacy)
+  // https://org.visualstudio.com/project/_git/repo
+  if remoteURL.contains(".visualstudio.com") && remoteURL.contains("/_git/") {
+    var url = remoteURL
+    if url.hasPrefix("https://") {
+      url = String(url.dropFirst(8))
+    }
+    // org.visualstudio.com/project/_git/repo
+    let parts = url.split(separator: "/")
+    guard parts.count >= 4,
+      parts[0].hasSuffix(".visualstudio.com"),
+      parts[2] == "_git"
+    else { return nil }
+
+    // Extract org from subdomain
+    let domain = String(parts[0])
+    let org = String(domain.dropLast(".visualstudio.com".count))
+    let project = String(parts[1])
+    let repo = String(parts[3])
+    return AzureContext(organization: org, project: project, repository: repo)
+  }
+
+  return nil
+}
+
+// MARK: - Comment Cache
+
+/// Cached comment count for a PR to avoid slow API calls
+struct CommentCache: Codable {
+  let prNumber: Int
+  let unresolvedCount: Int
+  let criticalCount: Int
+  let timestamp: Date
+
+  /// Check if cache is still valid (5 minute TTL)
+  var isValid: Bool {
+    Date().timeIntervalSince(timestamp) < 300
+  }
+}
+
+/// Get cache directory, creating if needed
+private func getCacheDirectory() -> URL {
+  let cacheDir = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".cache/claude-statusline")
+  try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+  return cacheDir
+}
+
+/// Generate cache key from platform, cwd, and PR number
+private func cacheKey(platform: Platform, cwd: String, prNumber: Int) -> String {
+  // Use a hash of cwd to keep filenames reasonable
+  let cwdHash = cwd.hashValue
+  return "\(platform)-\(cwdHash)-\(prNumber)"
+}
+
+/// Read cached comment count if valid
+func getCachedComments(platform: Platform, cwd: String, prNumber: Int) -> CommentCache? {
+  let key = cacheKey(platform: platform, cwd: cwd, prNumber: prNumber)
+  let cacheFile = getCacheDirectory().appendingPathComponent("\(key).json")
+
+  guard let data = try? Data(contentsOf: cacheFile),
+        let cache = try? JSONDecoder().decode(CommentCache.self, from: data),
+        cache.isValid
+  else { return nil }
+
+  return cache
+}
+
+/// Write comment count to cache (runs in background)
+func cacheComments(platform: Platform, cwd: String, prNumber: Int, unresolvedCount: Int, criticalCount: Int) {
+  Task.detached(priority: .utility) {
+    let key = cacheKey(platform: platform, cwd: cwd, prNumber: prNumber)
+    let cacheFile = getCacheDirectory().appendingPathComponent("\(key).json")
+    let cache = CommentCache(
+      prNumber: prNumber,
+      unresolvedCount: unresolvedCount,
+      criticalCount: criticalCount,
+      timestamp: Date()
+    )
+    if let data = try? JSONEncoder().encode(cache) {
+      try? data.write(to: cacheFile)
+    }
   }
 }
 
@@ -261,7 +475,7 @@ func printLine2(cwd: String, branch: String) async {
   case .github:
     await printGitHubPRStatus(cwd: cwd, branch: branch)
   case .azure:
-    await printAzurePRStatus(cwd: cwd, branch: branch)
+    await printAzurePRStatus(cwd: cwd, branch: branch, remoteURL: remoteURL)
   case .gitlab:
     await printGitLabPRStatus(cwd: cwd, branch: branch)
   case .unknown:
@@ -307,17 +521,35 @@ func printGitHubPRStatus(cwd: String, branch: String) async {
   }
 }
 
-func printAzurePRStatus(cwd: String, branch: String) async {
-  // Get PR info via az CLI
+func printAzurePRStatus(cwd: String, branch: String, remoteURL: String) async {
+  // Parse Azure context from remote URL
+  guard let azureContext = parseAzureContext(from: remoteURL) else {
+    FileHandle.standardError.write(
+      Data("⚠️ Could not parse Azure context from: \(remoteURL)\n".utf8)
+    )
+    return
+  }
+
+  // Get PR info via az CLI with explicit org/project
   guard
     let output = await runCommandInDir(
       "az",
       arguments: [
-        "repos", "pr", "list", "--source-branch", branch, "--status", "active", "-o", "json",
+        "repos", "pr", "list",
+        "--source-branch", branch,
+        "--status", "active",
+        "--organization", azureContext.organizationURL,
+        "--project", azureContext.project,
+        "-o", "json",
       ],
       cwd: cwd
     )
-  else { return }
+  else {
+    FileHandle.standardError.write(
+      Data("⚠️ az repos pr list failed for \(azureContext.project)\n".utf8)
+    )
+    return
+  }
 
   guard let prs = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [[String: Any]],
     let pr = prs.first,
@@ -325,11 +557,89 @@ func printAzurePRStatus(cwd: String, branch: String) async {
     let prStatus = pr["status"] as? String
   else { return }
 
+  // Get Azure Pipeline build status
+  let pipelineInfo = await getAzurePipelineStatus(
+    cwd: cwd,
+    branch: branch,
+    azureContext: azureContext
+  )
+
   // Get comment counts
   let commentInfo = await getCommentInfo(prNumber: prId, cwd: cwd, platform: .azure)
 
-  // Azure doesn't have built-in CI checks like GitHub, skip check status
-  print("  PR #\(prId) (\(prStatus))\(commentInfo)")
+  if !pipelineInfo.isEmpty {
+    print("  PR #\(prId) (\(prStatus)) │ \(pipelineInfo)\(commentInfo)")
+  } else {
+    print("  PR #\(prId) (\(prStatus))\(commentInfo)")
+  }
+}
+
+/// Fetch Azure Pipelines build status for current branch
+func getAzurePipelineStatus(cwd: String, branch: String, azureContext: AzureContext) async
+  -> String
+{
+  // Get recent pipeline runs for this branch
+  guard
+    let output = await runCommandInDir(
+      "az",
+      arguments: [
+        "pipelines", "runs", "list",
+        "--branch", branch,
+        "--top", "5",
+        "--organization", azureContext.organizationURL,
+        "--project", azureContext.project,
+        "-o", "json",
+      ],
+      cwd: cwd
+    )
+  else { return "" }
+
+  guard let runs = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [[String: Any]]
+  else { return "" }
+
+  // Count results
+  var success = 0
+  var failure = 0
+  var pending = 0
+
+  for run in runs {
+    let status = run["status"] as? String ?? ""
+    let result = run["result"] as? String ?? ""
+
+    if status == "completed" {
+      switch result {
+      case "succeeded":
+        success += 1
+      case "failed":
+        failure += 1
+      case "canceled", "partiallySucceeded":
+        pending += 1
+      default:
+        pending += 1
+      }
+    } else if status == "inProgress" || status == "notStarted" {
+      pending += 1
+    }
+  }
+
+  guard success + failure + pending > 0 else { return "" }
+
+  // Determine overall status
+  let statusText: String
+  let statusColor: String
+
+  if failure > 0 {
+    statusText = "FAILING"
+    statusColor = ANSIColor.red
+  } else if pending > 0 {
+    statusText = "PENDING"
+    statusColor = ANSIColor.yellow
+  } else {
+    statusText = "PASSING"
+    statusColor = ANSIColor.green
+  }
+
+  return "Builds: \(statusColor)\(statusText)\(ANSIColor.reset) [✓\(success) ✗\(failure) ⧗\(pending)]"
 }
 
 func printGitLabPRStatus(cwd: String, branch: String) async {
@@ -354,7 +664,26 @@ func printGitLabPRStatus(cwd: String, branch: String) async {
 }
 
 func getCommentInfo(prNumber: Int, cwd: String, platform: Platform) async -> String {
-  // Use pull-request-ping library to get comment counts
+  // Check cache first (instant, avoids slow API calls)
+  if let cached = getCachedComments(platform: platform, cwd: cwd, prNumber: prNumber) {
+    return formatCommentInfo(unresolvedCount: cached.unresolvedCount, criticalCount: cached.criticalCount)
+  }
+
+  // For Azure, return placeholder and fetch in background (Azure API is slow ~1.7s)
+  if platform == .azure {
+    // Trigger background fetch to populate cache for next call
+    Task.detached(priority: .utility) {
+      await fetchAndCacheComments(prNumber: prNumber, cwd: cwd, platform: platform)
+    }
+    return " │ 💬 ..."  // Placeholder while cache is being populated
+  }
+
+  // For GitHub/GitLab, fetch synchronously (fast enough)
+  return await fetchAndCacheComments(prNumber: prNumber, cwd: cwd, platform: platform)
+}
+
+/// Fetch comments from API and cache the result
+private func fetchAndCacheComments(prNumber: Int, cwd: String, platform: Platform) async -> String {
   let factory = ProviderFactory()
 
   let providerType: ProviderType
@@ -387,15 +716,33 @@ func getCommentInfo(prNumber: Int, cwd: String, platform: Platform) async -> Str
       criticalKeywords.contains { body.uppercased().contains($0.uppercased()) }
     }.count
 
-    if criticalCount > 0 {
-      return " │ 🚨 \(criticalCount) critical │ 💬 \(unresolvedCount) unresolved"
-    } else if unresolvedCount > 0 {
-      return " │ 💬 \(unresolvedCount) unresolved"
-    }
+    // Cache the result for future calls
+    cacheComments(
+      platform: platform,
+      cwd: cwd,
+      prNumber: prNumber,
+      unresolvedCount: unresolvedCount,
+      criticalCount: criticalCount
+    )
+
+    return formatCommentInfo(unresolvedCount: unresolvedCount, criticalCount: criticalCount)
   } catch {
-    // Fall back silently - comment info is optional enhancement
+    // Log error to stderr for debugging (comment info is optional enhancement)
+    FileHandle.standardError.write(
+      Data("⚠️ Comment fetch failed for \(platform) PR #\(prNumber): \(error)\n".utf8)
+    )
   }
 
+  return ""
+}
+
+/// Format comment info string
+private func formatCommentInfo(unresolvedCount: Int, criticalCount: Int) -> String {
+  if criticalCount > 0 {
+    return " │ 🚨 \(criticalCount) critical │ 💬 \(unresolvedCount) unresolved"
+  } else if unresolvedCount > 0 {
+    return " │ 💬 \(unresolvedCount) unresolved"
+  }
   return ""
 }
 
