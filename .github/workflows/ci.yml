@@ -13,13 +13,13 @@ permissions:
 
 jobs:
   ci:
-    uses: promptping-ai/.github/.github/workflows/graphite-swift-ci.yml@v1
+    uses: promptping-ai/.github/workflows/graphite-swift-ci.yml@v1
     secrets: inherit
 
   rules:
-    uses: promptping-ai/.github/.github/workflows/swift-rules-check.yml@v1
+    uses: promptping-ai/.github/workflows/swift-rules-check.yml@v1
     secrets: inherit
 
   review:
-    uses: promptping-ai/.github/.github/workflows/swift-review.yml@v1
+    uses: promptping-ai/.github/workflows/swift-review.yml@v1
     secrets: inherit
