@@ -1,41 +1,25 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  pull_request:  # No branch filter - allows stacked PRs!
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write  # Required for Claude Code OIDC
 
 jobs:
-  build:
-    name: Build & Test
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
+  ci:
+    uses: promptping-ai/.github/.github/workflows/graphite-swift-ci.yml@v1
+    secrets: inherit
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.2.app
+  rules:
+    uses: promptping-ai/.github/.github/workflows/swift-rules-check.yml@v1
+    secrets: inherit
 
-      - name: Show Swift Version
-        run: swift --version
-
-      - name: Build
-        run: swift build -v
-
-      - name: Run Tests
-        run: swift test -v
-
-      - name: Build Release
-        run: swift build -c release
-
-  lint:
-    name: Swift Format
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.2.app
-
-      - name: Check Formatting
-        run: swift format lint -s -p -r Sources Tests Package.swift
+  review:
+    uses: promptping-ai/.github/.github/workflows/swift-review.yml@v1
+    secrets: inherit

@@ -8,7 +8,7 @@ let package = Package(
     .executable(
       name: "claude-statusline",
       targets: ["claude-statusline"]
-    ),
+    )
   ],
   dependencies: [
     // PR comment library for multi-platform support

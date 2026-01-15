@@ -312,7 +312,9 @@ func printAzurePRStatus(cwd: String, branch: String) async {
   guard
     let output = await runCommandInDir(
       "az",
-      arguments: ["repos", "pr", "list", "--source-branch", branch, "--status", "active", "-o", "json"],
+      arguments: [
+        "repos", "pr", "list", "--source-branch", branch, "--status", "active", "-o", "json",
+      ],
       cwd: cwd
     )
   else { return }
