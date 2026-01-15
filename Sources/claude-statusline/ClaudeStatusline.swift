@@ -105,7 +105,7 @@ struct ClaudeStatusline: AsyncParsableCommand {
     // Get plan subject from session mapping
     let planName = getPlanSubject(sessionId: input?.sessionId)
 
-    // Build Line 1: Main status
+    // Build Line 1: Main status (always fast, no caching needed)
     printLine1(
       project: project,
       planName: planName,
@@ -114,16 +114,349 @@ struct ClaudeStatusline: AsyncParsableCommand {
       account: ProcessInfo.processInfo.environment["CLAUDE_ACCOUNT"]
     )
 
-    // Build Line 2: PR status (if on a branch with PR)
-    if let branch = branch, branch != "main" {
-      await printLine2(cwd: cwd, branch: branch)
-    }
+    // Cache-first strategy for Line 2 & 3
+    guard let branch = branch else { return }
 
-    // Build Line 3: Graphite stack
-    if branch != nil {
-      await printLine3(cwd: cwd)
+    // Load cache and check for hit
+    await PRCache.shared.load()
+    let cached = await PRCache.shared.get(for: cwd, branch: branch)
+
+    if let cached = cached {
+      // Cache hit: print from cache immediately
+      if debugMode {
+        debugLog("Cache hit for \(cwd):\(branch)")
+        if let age = await PRCache.shared.age(for: cwd, branch: branch) {
+          debugLog("Cache age: \(Int(age))s")
+        }
+      }
+      printFromCache(cached)
+
+      // Background refresh for next time (fire-and-forget after printing cached data)
+      Task {
+        let freshData = await fetchFreshPRData(
+          cwd: cwd,
+          branch: branch,
+          platform: platform,
+          remoteURL: remoteURL
+        )
+        await PRCache.shared.set(freshData, for: cwd)
+        await PRCache.shared.save()
+      }
+    } else {
+      // Cache miss: fetch with timeout to ensure Lines 2 & 3 are printed
+      if debugMode {
+        debugLog("Cache miss for \(cwd):\(branch)")
+      }
+
+      do {
+        let freshData = try await withTimeout(seconds: 4.0) {
+          await fetchFreshPRData(
+            cwd: cwd,
+            branch: branch,
+            platform: platform,
+            remoteURL: remoteURL
+          )
+        }
+
+        // Cache the result for future runs
+        await PRCache.shared.set(freshData, for: cwd)
+        await PRCache.shared.save()
+
+        // Print immediately
+        printFromCache(freshData)
+      } catch is TimeoutError {
+        if debugMode {
+          debugLog("Fetch timed out after 3 seconds")
+        }
+        // Timeout: show nothing for Lines 2 & 3 (graceful degradation)
+      } catch {
+        if debugMode {
+          debugLog("Fetch failed: \(error)")
+        }
+        // Other error: show nothing for Lines 2 & 3
+      }
     }
   }
+}
+
+// MARK: - Timeout Utilities
+
+/// Error thrown when an operation exceeds the timeout duration
+struct TimeoutError: Error {}
+
+/// Execute an async operation with a maximum timeout duration
+///
+/// If the operation completes within the timeout, returns its result.
+/// If the timeout is exceeded, throws TimeoutError and cancels the operation.
+func withTimeout<T: Sendable>(
+  seconds: TimeInterval,
+  operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+  try await withThrowingTaskGroup(of: Optional<T>.self) { group in
+    // Add the main operation
+    group.addTask {
+      try await operation()
+    }
+
+    // Add timeout task
+    group.addTask {
+      try await Task.sleep(for: .seconds(seconds))
+      throw TimeoutError()
+    }
+
+    // Return first result (whichever completes first)
+    if let result = try await group.next() {
+      group.cancelAll()
+      return result!
+    }
+
+    group.cancelAll()
+    throw TimeoutError()
+  }
+}
+
+// MARK: - Cache Output
+
+/// Print Line 2 & 3 from cached data
+func printFromCache(_ data: CachedPRData) {
+  // Line 2: PR status
+  if let prNumber = data.prNumber, let prState = data.prState {
+    var line2Parts = ["  PR #\(prNumber) (\(prState))"]
+
+    if let checksStatus = data.checksStatus, let checksDetail = data.checksDetail {
+      let color =
+        checksStatus == "PASSING"
+        ? ANSIColor.green
+        : (checksStatus == "FAILING" ? ANSIColor.red : ANSIColor.yellow)
+      line2Parts.append("Checks: \(color)\(checksStatus)\(ANSIColor.reset) \(checksDetail)")
+    }
+
+    if let commentInfo = data.commentInfo, !commentInfo.isEmpty {
+      line2Parts.append(commentInfo)
+    }
+
+    print(line2Parts.joined(separator: " │ "))
+  }
+
+  // Line 3: Graphite stack
+  if let stack = data.graphiteStack, !stack.isEmpty {
+    print("  \(ANSIColor.dim)\(stack)\(ANSIColor.reset)")
+  }
+}
+
+// MARK: - Fresh Data Fetching
+
+/// Fetch fresh PR data for caching
+func fetchFreshPRData(
+  cwd: String,
+  branch: String,
+  platform: Platform,
+  remoteURL: String?
+) async -> CachedPRData {
+  var prNumber: Int?
+  var prState: String?
+  var checksStatus: String?
+  var checksDetail: String?
+  var commentInfo: String?
+  var criticalCount = 0
+  var graphiteStack: String?
+
+  // Fetch PR data based on platform (only if not on main)
+  if branch != "main" {
+    switch platform {
+    case .github:
+      let prData = await fetchGitHubPRData(cwd: cwd, branch: branch)
+      prNumber = prData.prNumber
+      prState = prData.prState
+      checksStatus = prData.checksStatus
+      checksDetail = prData.checksDetail
+      commentInfo = prData.commentInfo
+      criticalCount = prData.criticalCount
+
+    case .azure:
+      if let url = remoteURL {
+        let prData = await fetchAzurePRData(cwd: cwd, branch: branch, remoteURL: url)
+        prNumber = prData.prNumber
+        prState = prData.prState
+        checksStatus = prData.checksStatus
+        checksDetail = prData.checksDetail
+        commentInfo = prData.commentInfo
+        criticalCount = prData.criticalCount
+      }
+
+    case .gitlab:
+      let prData = await fetchGitLabPRData(cwd: cwd, branch: branch)
+      prNumber = prData.prNumber
+      prState = prData.prState
+      commentInfo = prData.commentInfo
+      criticalCount = prData.criticalCount
+
+    case .unknown:
+      break
+    }
+  }
+
+  // Fetch Graphite stack
+  graphiteStack = await fetchGraphiteStack(cwd: cwd)
+
+  return CachedPRData(
+    branch: branch,
+    prNumber: prNumber,
+    prState: prState,
+    checksStatus: checksStatus,
+    checksDetail: checksDetail,
+    commentInfo: commentInfo,
+    criticalCount: criticalCount,
+    graphiteStack: graphiteStack
+  )
+}
+
+// MARK: - Platform-specific PR Data Fetching
+
+struct PRFetchResult {
+  var prNumber: Int?
+  var prState: String?
+  var checksStatus: String?
+  var checksDetail: String?
+  var commentInfo: String?
+  var criticalCount: Int = 0
+}
+
+func fetchGitHubPRData(cwd: String, branch: String) async -> PRFetchResult {
+  var result = PRFetchResult()
+
+  guard
+    let output = await runCommandInDir(
+      "gh",
+      arguments: ["pr", "view", "--json", "number,state,statusCheckRollup,reviewDecision"],
+      cwd: cwd
+    )
+  else { return result }
+
+  guard let prData = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any],
+    let prNumber = prData["number"] as? Int,
+    let prState = prData["state"] as? String
+  else { return result }
+
+  result.prNumber = prNumber
+  result.prState = prState
+
+  // Parse checks
+  let checks = prData["statusCheckRollup"] as? [[String: Any]] ?? []
+  if !checks.isEmpty {
+    let (statusText, _, success, failure, pending) = parseChecks(checks)
+    result.checksStatus = statusText
+    result.checksDetail = "[✓\(success) ✗\(failure) ⧗\(pending)]"
+  }
+
+  // Get comment info
+  result.commentInfo = await getCommentInfo(prNumber: prNumber, cwd: cwd, platform: .github)
+
+  return result
+}
+
+func fetchAzurePRData(cwd: String, branch: String, remoteURL: String) async -> PRFetchResult {
+  var result = PRFetchResult()
+
+  guard let azureContext = parseAzureContext(from: remoteURL) else { return result }
+
+  guard
+    let output = await runCommandInDir(
+      "az",
+      arguments: [
+        "repos", "pr", "list",
+        "--source-branch", branch,
+        "--status", "active",
+        "--organization", azureContext.organizationURL,
+        "--project", azureContext.project,
+        "-o", "json",
+      ],
+      cwd: cwd
+    )
+  else { return result }
+
+  guard let prs = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [[String: Any]],
+    let pr = prs.first,
+    let prId = pr["pullRequestId"] as? Int,
+    let prStatus = pr["status"] as? String
+  else { return result }
+
+  result.prNumber = prId
+  result.prState = prStatus
+
+  // Get pipeline status
+  let pipelineInfo = await getAzurePipelineStatus(
+    cwd: cwd,
+    branch: branch,
+    azureContext: azureContext
+  )
+  if !pipelineInfo.isEmpty {
+    // Parse pipeline info for status/detail
+    if pipelineInfo.contains("PASSING") {
+      result.checksStatus = "PASSING"
+    } else if pipelineInfo.contains("FAILING") {
+      result.checksStatus = "FAILING"
+    } else if pipelineInfo.contains("PENDING") {
+      result.checksStatus = "PENDING"
+    }
+    // Extract detail portion
+    if let bracketStart = pipelineInfo.firstIndex(of: "["),
+      let bracketEnd = pipelineInfo.lastIndex(of: "]")
+    {
+      result.checksDetail = String(pipelineInfo[bracketStart...bracketEnd])
+    }
+  }
+
+  // Get comment info
+  result.commentInfo = await getCommentInfo(prNumber: prId, cwd: cwd, platform: .azure)
+
+  return result
+}
+
+func fetchGitLabPRData(cwd: String, branch: String) async -> PRFetchResult {
+  var result = PRFetchResult()
+
+  guard
+    let output = await runCommandInDir(
+      "glab",
+      arguments: ["mr", "view", "--json", "iid,state"],
+      cwd: cwd
+    )
+  else { return result }
+
+  guard let mrData = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [String: Any],
+    let mrNumber = mrData["iid"] as? Int,
+    let mrState = mrData["state"] as? String
+  else { return result }
+
+  result.prNumber = mrNumber
+  result.prState = mrState
+
+  // Get comment info
+  result.commentInfo = await getCommentInfo(prNumber: mrNumber, cwd: cwd, platform: .gitlab)
+
+  return result
+}
+
+func fetchGraphiteStack(cwd: String) async -> String? {
+  guard let output = await runCommandInDir("gt", arguments: ["ls", "-s"], cwd: cwd)
+  else { return nil }
+
+  let lines = output.split(separator: "\n")
+  var stackParts: [String] = []
+
+  for line in lines {
+    let lineStr = String(line)
+    if lineStr.hasPrefix("◉") {
+      let branch = String(lineStr.dropFirst(1)).trimmingCharacters(in: CharacterSet.whitespaces)
+      stackParts.append("◉ \(branch)")
+    } else if lineStr.hasPrefix("◯") {
+      let branch = String(lineStr.dropFirst(1)).trimmingCharacters(in: CharacterSet.whitespaces)
+      stackParts.append("○ \(branch)")
+    }
+  }
+
+  return stackParts.count > 1 ? stackParts.joined(separator: " → ") : nil
 }
 
 /// Log debug message to stderr
@@ -308,6 +641,38 @@ func parseAzureContext(from remoteURL: String) -> AzureContext? {
   return nil
 }
 
+/// Extract repository name from Azure DevOps remote URL
+/// Supports both SSH and HTTPS formats
+func extractAzureRepoName(from url: String) -> String? {
+  // SSH format: git@ssh.dev.azure.com:v3/org/project/RepoName
+  if url.hasPrefix("git@ssh.dev.azure.com:v3/") {
+    let path = String(url.dropFirst("git@ssh.dev.azure.com:v3/".count))
+    let components = path.split(separator: "/")
+    // components: ["org", "project", "RepoName"]
+    if components.count >= 3 {
+      return String(components[2])
+    }
+  }
+
+  // HTTPS format: https://dev.azure.com/org/project/_git/RepoName
+  if url.contains("dev.azure.com") && url.contains("/_git/") {
+    let components = url.components(separatedBy: "/_git/")
+    if components.count >= 2 {
+      return components[1]  // Return everything after /_git/
+    }
+  }
+
+  // Legacy format: https://org.visualstudio.com/project/_git/RepoName
+  if url.contains(".visualstudio.com") && url.contains("/_git/") {
+    let components = url.components(separatedBy: "/_git/")
+    if components.count >= 2 {
+      return components[1]  // Return everything after /_git/
+    }
+  }
+
+  return nil
+}
+
 // MARK: - Comment Cache
 
 /// Cached comment count for a PR to avoid slow API calls
@@ -344,15 +709,17 @@ func getCachedComments(platform: Platform, cwd: String, prNumber: Int) -> Commen
   let cacheFile = getCacheDirectory().appendingPathComponent("\(key).json")
 
   guard let data = try? Data(contentsOf: cacheFile),
-        let cache = try? JSONDecoder().decode(CommentCache.self, from: data),
-        cache.isValid
+    let cache = try? JSONDecoder().decode(CommentCache.self, from: data),
+    cache.isValid
   else { return nil }
 
   return cache
 }
 
 /// Write comment count to cache (runs in background)
-func cacheComments(platform: Platform, cwd: String, prNumber: Int, unresolvedCount: Int, criticalCount: Int) {
+func cacheComments(
+  platform: Platform, cwd: String, prNumber: Int, unresolvedCount: Int, criticalCount: Int
+) {
   Task.detached(priority: .utility) {
     let key = cacheKey(platform: platform, cwd: cwd, prNumber: prNumber)
     let cacheFile = getCacheDirectory().appendingPathComponent("\(key).json")
@@ -360,6 +727,47 @@ func cacheComments(platform: Platform, cwd: String, prNumber: Int, unresolvedCou
       prNumber: prNumber,
       unresolvedCount: unresolvedCount,
       criticalCount: criticalCount,
+      timestamp: Date()
+    )
+    if let data = try? JSONEncoder().encode(cache) {
+      try? data.write(to: cacheFile)
+    }
+  }
+}
+
+// MARK: - Summary Cache (EdgePrompt Results)
+
+/// Cached edgeprompt summary to avoid repeated LLM calls
+struct SummaryCache: Codable, Sendable {
+  let textHash: String
+  let summary: String
+  let timestamp: Date
+
+  /// Check if cache is still valid (1 hour TTL)
+  var isValid: Bool {
+    Date().timeIntervalSince(timestamp) < 3600
+  }
+}
+
+/// Read cached summary if valid (instant, no LLM cost)
+func getCachedSummary(textHash: String) -> String? {
+  let cacheFile = getCacheDirectory().appendingPathComponent("summary-\(textHash).json")
+
+  guard let data = try? Data(contentsOf: cacheFile),
+    let cache = try? JSONDecoder().decode(SummaryCache.self, from: data),
+    cache.isValid
+  else { return nil }
+
+  return cache.summary
+}
+
+/// Write edgeprompt summary to cache (runs in background)
+func cacheSummary(textHash: String, summary: String) {
+  Task.detached(priority: .utility) {
+    let cacheFile = getCacheDirectory().appendingPathComponent("summary-\(textHash).json")
+    let cache = SummaryCache(
+      textHash: textHash,
+      summary: summary,
       timestamp: Date()
     )
     if let data = try? JSONEncoder().encode(cache) {
@@ -404,6 +812,74 @@ func runCommandInDir(_ executable: String, arguments: [String], cwd: String) asy
     return String(decoding: result.standardOutput, as: UTF8.self)
       .trimmingCharacters(in: .whitespacesAndNewlines)
   } catch {
+    return nil
+  }
+}
+
+// MARK: - EdgePrompt Integration
+
+/// Summarize text using edgeprompt CLI (local LLM, 0 tokens) with caching and timeout
+/// Returns nil if edgeprompt unavailable or fails (graceful degradation)
+func summarizeWithEdgePrompt(_ text: String, maxWords: Int = 10) async -> String? {
+  guard !text.isEmpty else { return nil }
+
+  // Use hash of input text as cache key
+  let textHash = text.hashValue.description
+
+  // Check cache first (instant, no LLM cost)
+  if let cached = getCachedSummary(textHash: textHash) {
+    if debugMode {
+      debugLog("Summary cache hit for hash: \(textHash)")
+    }
+    return cached
+  }
+
+  do {
+    // Wrap in timeout (2 seconds max)
+    return try await withTimeout(seconds: 2.0) {
+      let result = try await Subprocess.run(
+        .name("edgeprompt"),
+        arguments: Arguments(["summarize", "--max-length", String(maxWords), "--json"]),
+        input: .string(text),
+        output: .bytes(limit: 1024 * 1024),
+        error: .discarded
+      )
+
+      guard result.terminationStatus.isSuccess else { return nil }
+
+      let outputString = String(decoding: result.standardOutput, as: UTF8.self)
+
+      // Parse JSON response for "summary" field
+      guard let jsonData = outputString.data(using: String.Encoding.utf8),
+        let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+        let summary = json["summary"] as? String
+      else { return nil }
+
+      // Clean up the summary (remove trailing markers and newlines for single-line output)
+      let cleanSummary =
+        summary
+        .replacingOccurrences(of: " [Summary generated by local LLM]", with: "")
+        .replacingOccurrences(of: "...", with: "")
+        .replacingOccurrences(of: "\n", with: " ")  // Newlines break multi-line statusline format
+        .replacingOccurrences(of: "  ", with: " ")  // Collapse double spaces from newline removal
+        .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+
+      if !cleanSummary.isEmpty {
+        // Cache the result for next time (background)
+        cacheSummary(textHash: textHash, summary: cleanSummary)
+        return cleanSummary
+      }
+      return nil
+    }
+  } catch is TimeoutError {
+    if debugMode {
+      debugLog("EdgePrompt timed out after 2 seconds")
+    }
+    return nil
+  } catch {
+    if debugMode {
+      debugLog("EdgePrompt failed: \(error)")
+    }
     return nil
   }
 }
@@ -530,18 +1006,30 @@ func printAzurePRStatus(cwd: String, branch: String, remoteURL: String) async {
     return
   }
 
-  // Get PR info via az CLI with explicit org/project
+  // Extract repository name from remote URL to filter PRs to current repo only
+  let repoName = extractAzureRepoName(from: remoteURL)
+
+  // Build az CLI arguments with optional repository filter
+  var arguments = [
+    "repos", "pr", "list",
+    "--source-branch", branch,
+    "--status", "active",
+    "--organization", azureContext.organizationURL,
+    "--project", azureContext.project,
+  ]
+
+  // Add repository filter if we can extract it (prevents wrong PR from different repo in same project)
+  if let repo = repoName {
+    arguments.append(contentsOf: ["--repository", repo])
+  }
+
+  arguments.append(contentsOf: ["-o", "json"])
+
+  // Get PR info via az CLI with explicit org/project and optional repository filter
   guard
     let output = await runCommandInDir(
       "az",
-      arguments: [
-        "repos", "pr", "list",
-        "--source-branch", branch,
-        "--status", "active",
-        "--organization", azureContext.organizationURL,
-        "--project", azureContext.project,
-        "-o", "json",
-      ],
+      arguments: arguments,
       cwd: cwd
     )
   else {
@@ -639,7 +1127,8 @@ func getAzurePipelineStatus(cwd: String, branch: String, azureContext: AzureCont
     statusColor = ANSIColor.green
   }
 
-  return "Builds: \(statusColor)\(statusText)\(ANSIColor.reset) [✓\(success) ✗\(failure) ⧗\(pending)]"
+  return
+    "Builds: \(statusColor)\(statusText)\(ANSIColor.reset) [✓\(success) ✗\(failure) ⧗\(pending)]"
 }
 
 func printGitLabPRStatus(cwd: String, branch: String) async {
@@ -666,19 +1155,12 @@ func printGitLabPRStatus(cwd: String, branch: String) async {
 func getCommentInfo(prNumber: Int, cwd: String, platform: Platform) async -> String {
   // Check cache first (instant, avoids slow API calls)
   if let cached = getCachedComments(platform: platform, cwd: cwd, prNumber: prNumber) {
-    return formatCommentInfo(unresolvedCount: cached.unresolvedCount, criticalCount: cached.criticalCount)
+    return formatCommentInfo(
+      unresolvedCount: cached.unresolvedCount, criticalCount: cached.criticalCount)
   }
 
-  // For Azure, return placeholder and fetch in background (Azure API is slow ~1.7s)
-  if platform == .azure {
-    // Trigger background fetch to populate cache for next call
-    Task.detached(priority: .utility) {
-      await fetchAndCacheComments(prNumber: prNumber, cwd: cwd, platform: platform)
-    }
-    return " │ 💬 ..."  // Placeholder while cache is being populated
-  }
-
-  // For GitHub/GitLab, fetch synchronously (fast enough)
+  // Fetch synchronously for all platforms - we have a 3s overall timeout
+  // that prevents the statusline from blocking too long
   return await fetchAndCacheComments(prNumber: prNumber, cwd: cwd, platform: platform)
 }
 
@@ -698,16 +1180,29 @@ private func fetchAndCacheComments(prNumber: Int, cwd: String, platform: Platfor
     let provider = try await factory.createProvider(manualType: providerType)
     let pr = try await provider.fetchPR(identifier: String(prNumber), repo: nil)
 
-    // Count unresolved comments
-    let unresolvedReviews = pr.reviews.filter { review in
-      if let comments = review.comments {
-        return comments.contains { $0.isResolved == false }
-      }
-      return false
-    }
+    // Count unresolved comments and collect their bodies
+    let unresolvedComments = pr.reviews.flatMap { $0.comments ?? [] }
+      .filter { $0.isResolved == false }
+    let unresolvedCount = unresolvedComments.count
+    let unresolvedBodies = unresolvedComments.map(\.body)
 
-    let unresolvedCount = unresolvedReviews.flatMap { $0.comments ?? [] }
-      .filter { $0.isResolved == false }.count
+    // Filter out notification-type messages (Azure activity, not actual review comments)
+    // These include: reviewer additions, approvals, status changes, empty bodies
+    let actualReviewComments = unresolvedBodies.filter { body in
+      let lowerBody = body.lowercased()
+      let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+
+      // Exclude Azure notification patterns
+      let isNotification =
+        (lowerBody.contains("added") && lowerBody.contains("as a reviewer"))
+        || (lowerBody.contains("approved") && lowerBody.contains("pull request"))
+        || (lowerBody.contains("requested changes"))
+        || (lowerBody.contains("voted") && lowerBody.contains("on the pull request"))
+        || (lowerBody.contains("reset") && lowerBody.contains("vote"))
+        || trimmedBody.isEmpty
+
+      return !isNotification
+    }
 
     // Check for critical keywords
     let allCommentBodies = pr.comments.map(\.body) + pr.reviews.compactMap(\.body)
@@ -716,16 +1211,23 @@ private func fetchAndCacheComments(prNumber: Int, cwd: String, platform: Platfor
       criticalKeywords.contains { body.uppercased().contains($0.uppercased()) }
     }.count
 
-    // Cache the result for future calls
-    cacheComments(
-      platform: platform,
-      cwd: cwd,
-      prNumber: prNumber,
-      unresolvedCount: unresolvedCount,
-      criticalCount: criticalCount
-    )
+    // Try EdgePrompt summarization if there are actual review comments (not just notifications)
+    if !actualReviewComments.isEmpty {
+      let combinedText = actualReviewComments.joined(separator: "\n\n")
+      if let summary = await summarizeWithEdgePrompt(combinedText, maxWords: 15) {
+        if criticalCount > 0 {
+          return " │ 🚨 \(criticalCount) critical │ 💬 \(summary)"
+        }
+        return " │ 💬 \(summary)"
+      }
+    }
 
-    return formatCommentInfo(unresolvedCount: unresolvedCount, criticalCount: criticalCount)
+    // Fallback: count-based display if EdgePrompt unavailable
+    if criticalCount > 0 {
+      return " │ 🚨 \(criticalCount) critical │ 💬 \(unresolvedCount) unresolved"
+    } else if unresolvedCount > 0 {
+      return " │ 💬 \(unresolvedCount) unresolved"
+    }
   } catch {
     // Log error to stderr for debugging (comment info is optional enhancement)
     FileHandle.standardError.write(

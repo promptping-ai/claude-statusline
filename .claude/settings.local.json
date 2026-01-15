@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(az repos pr list:*)",
+      "Bash(git stash:*)",
+      "Bash(git checkout:*)",
+      "Bash(az pipelines runs list:*)"
+    ]
+  }
+}
